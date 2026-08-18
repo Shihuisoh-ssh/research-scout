@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import sys
 import time
 import urllib.error
@@ -10,6 +11,8 @@ from bs4 import BeautifulSoup
 from ddgs import DDGS
 
 ENV_FILE = ".env"
+
+MAX_STEPS = 6
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -62,12 +65,12 @@ def read_settings():
     }, []
 
 
-def call_model(settings, prompt):
-    """Call the model and return the reply text, with retries for 429/5xx."""
+def call_model(settings, messages):
+    """Call the model with a message list and return the reply text, with retries."""
     url = settings["API_BASE_URL"] + "/chat/completions"
     body = json.dumps({
         "model": settings["MODEL"],
-        "messages": [{"role": "user", "content": prompt}],
+        "messages": messages,
     }).encode("utf-8")
 
     headers = {
@@ -205,6 +208,212 @@ def read_webpage(url):
     return text[:2000]
 
 
+def _parse_action(text):
+    """Strip markdown fences if present and parse the model's JSON action."""
+    text = text.strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?\s*", "", text)
+        text = re.sub(r"\s*```$", "", text)
+        text = text.strip()
+    try:
+        obj = json.loads(text)
+    except Exception:
+        match = re.search(r"\{.*\}", text, re.DOTALL)
+        if match:
+            try:
+                obj = json.loads(match.group(0))
+            except Exception:
+                return None
+        else:
+            return None
+    if not isinstance(obj, dict):
+        return None
+    return obj
+
+
+def _format_state(state, question, step):
+    """Build the prompt body: the goal, the step budget, and full history."""
+    lines = []
+    lines.append("Goal: " + question)
+    lines.append(
+        "You are on step " + str(step) + " of " + str(MAX_STEPS) +
+        " allowed steps. Choose your next action."
+    )
+    lines.append("")
+    lines.append("What has happened so far:")
+    if not state:
+        lines.append("(nothing yet -- this is your first step)")
+    else:
+        for entry in state:
+            lines.append(
+                "Step " + str(entry["step"]) + " [" + entry["action"] + "]: " +
+                entry.get("reason", "")
+            )
+            if entry["action"] == "SEARCH":
+                lines.append("  query: " + entry.get("query", ""))
+            elif entry["action"] == "READ":
+                lines.append("  url: " + entry.get("url", ""))
+            lines.append("  observation: " + entry.get("observation", ""))
+    lines.append("")
+    lines.append("Reply now with only the JSON action object, nothing else.")
+    return "\n".join(lines)
+
+
+def _collect_sources(state):
+    """Return a de-duplicated list of source URLs seen during the research."""
+    sources = []
+    for entry in state:
+        if entry["action"] == "READ" and entry.get("url"):
+            if entry["url"] not in sources:
+                sources.append(entry["url"])
+        elif entry["action"] == "SEARCH":
+            for result in entry.get("results", []):
+                url = result.get("url")
+                if url and url not in sources:
+                    sources.append(url)
+    return sources
+
+
+def _split_report(report):
+    """Split the FINISH report into Findings/Comparison/Recommendation."""
+    result = {"Findings": "", "Comparison": "", "Recommendation": ""}
+    current = None
+    for line in report.splitlines():
+        match = re.match(
+            r"^\s*(findings|comparison|recommendation)\s*[:\-]\s*(.*)$",
+            line, re.IGNORECASE,
+        )
+        if match:
+            current = match.group(1).capitalize()
+            result[current] = (match.group(2).strip() + "\n")
+        elif current is not None:
+            result[current] += line + "\n"
+    if not any(result.values()):
+        result["Findings"] = report
+    return result
+
+
+def _print_brief(question, state, report):
+    """Print the final research brief with the required sections."""
+    sections = _split_report(report)
+    sources = _collect_sources(state)
+    print("")
+    print("=" * 60)
+    print("RESEARCH BRIEF")
+    print("=" * 60)
+    print("\nQuestion:\n" + question)
+    print("\nFindings:\n" + sections["Findings"].strip())
+    print("\nComparison:\n" + sections["Comparison"].strip())
+    print("\nRecommendation:\n" + sections["Recommendation"].strip())
+    print("\nSources:")
+    if sources:
+        for index, url in enumerate(sources, 1):
+            print("  " + str(index) + ". " + url)
+    else:
+        print("  (none)")
+    print("=" * 60)
+
+
+def research(settings, question):
+    """Run the explicit tool-using research loop and print a brief."""
+    system = (
+        "You are a research agent working toward this goal:\n" + question + "\n\n"
+        "You have three tools:\n"
+        "- SEARCH: " + SEARCH_WEB_DESCRIPTION + " Use it to find pages.\n"
+        "- READ: " + READ_WEBPAGE_DESCRIPTION +
+        " Page text often contains navigation and menus, so read it critically.\n"
+        "- FINISH: stop researching and return your final report.\n\n"
+        "On every step reply with ONLY a single JSON object, no prose, in one of:\n"
+        '{"reason": "one short sentence", "action": "SEARCH", "query": "..."}\n'
+        '{"reason": "one short sentence", "action": "READ", "url": "..."}\n'
+        '{"reason": "one short sentence", "action": "FINISH", "report": "..."}\n\n'
+        "You may take at most " + str(MAX_STEPS) + " steps total. "
+        "When you have enough information, choose FINISH. "
+        "When FINISH, write the report as plain text with three labeled "
+        "sections, each starting on its own line:\n"
+        "Findings: <what you learned>\n"
+        "Comparison: <how the sources compare>\n"
+        "Recommendation: <what you recommend>\n\n"
+        "A failed search or a page that will not load is normal. Record what "
+        "happened and choose a different approach on the next step."
+    )
+
+    state = []
+    for step in range(1, MAX_STEPS + 1):
+        messages = [
+            {"role": "system", "content": system},
+            {"role": "user", "content": _format_state(state, question, step)},
+        ]
+        reply = call_model(settings, messages)
+        if reply is None:
+            print("Model call failed; stopping the agent.")
+            return None
+
+        action_obj = _parse_action(reply)
+        if action_obj is None:
+            print("Could not parse the model's reply as JSON. Raw reply:")
+            print(reply)
+            print("Stopping the agent.")
+            return None
+
+        reason = action_obj.get("reason", "")
+        action = action_obj.get("action")
+        print("Step " + str(step) + ": " + str(action) + " -- " + reason)
+
+        if action == "SEARCH":
+            query = action_obj.get("query", "")
+            results = search_web(query)
+            observation = (
+                "Search returned " + str(len(results)) + " result(s): " +
+                json.dumps(results, ensure_ascii=False)
+            )
+            state.append({
+                "step": step, "reason": reason, "action": "SEARCH",
+                "query": query, "results": results, "observation": observation,
+            })
+            summary = (
+                str(len(results)) + " result(s)" +
+                ("; first: " + results[0]["title"] if results else "; no results")
+            )
+        elif action == "READ":
+            url = action_obj.get("url", "")
+            text = read_webpage(url)
+            if text:
+                observation = "Page text (truncated): " + text[:1500]
+                summary = "loaded " + str(len(text)) + " chars"
+            else:
+                observation = "Page could not be loaded or returned no text."
+                summary = "load failed"
+            state.append({
+                "step": step, "reason": reason, "action": "READ",
+                "url": url, "observation": observation,
+            })
+        elif action == "FINISH":
+            report = action_obj.get("report", "")
+            state.append({
+                "step": step, "reason": reason, "action": "FINISH",
+                "observation": "Agent finished.",
+            })
+            print("  Observation: agent chose to finish.")
+            _print_brief(question, state, report)
+            return report
+        else:
+            observation = "Unknown action: " + str(action)
+            summary = "unknown action"
+            state.append({
+                "step": step, "reason": reason, "action": str(action),
+                "observation": observation,
+            })
+
+        print("  Observation: " + summary)
+
+    print(
+        "Step limit of " + str(MAX_STEPS) +
+        " reached without FINISH. Stopping without a final brief."
+    )
+    return None
+
+
 def main():
     if len(sys.argv) > 1:
         command = sys.argv[1]
@@ -237,7 +446,7 @@ def main():
         print("Please set the missing value(s) in your .env file and try again.")
         return
 
-    reply = call_model(settings, question)
+    reply = research(settings, question)
     if reply is not None:
         print("Reply from model:")
         print(reply)
