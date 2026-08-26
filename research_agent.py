@@ -347,14 +347,14 @@ def research(settings, question):
         reply = call_model(settings, messages)
         if reply is None:
             print("Model call failed; stopping the agent.")
-            return None
+            return None, state
 
         action_obj = _parse_action(reply)
         if action_obj is None:
             print("Could not parse the model's reply as JSON. Raw reply:")
             print(reply)
             print("Stopping the agent.")
-            return None
+            return None, state
 
         reason = action_obj.get("reason", "")
         action = action_obj.get("action")
@@ -396,7 +396,7 @@ def research(settings, question):
             })
             print("  Observation: agent chose to finish.")
             _print_brief(question, state, report)
-            return report
+            return report, state
         else:
             observation = "Unknown action: " + str(action)
             summary = "unknown action"
@@ -411,12 +411,65 @@ def research(settings, question):
         "Step limit of " + str(MAX_STEPS) +
         " reached without FINISH. Stopping without a final brief."
     )
-    return None
+    return None, state
+
+
+def evaluate_run(state, report):
+    """Check a completed run's actual state and output. Returns (results, score)."""
+    results = []
+
+    search_used = any(entry["action"] == "SEARCH" for entry in state)
+    results.append(("search tool used at least once", search_used))
+
+    sources = _collect_sources(state)
+    results.append(("more than one distinct source consulted", len(sources) > 1))
+
+    finished = any(entry["action"] == "FINISH" for entry in state)
+    results.append(("run stayed within step limit", finished))
+
+    sections = _split_report(report) if report else {"Recommendation": ""}
+    has_recommendation = bool(sections.get("Recommendation", "").strip())
+    results.append(("brief contains a recommendation", has_recommendation))
+
+    results.append(("brief lists at least three sources", len(sources) >= 3))
+
+    return results, sum(1 for _, ok in results if ok)
+
+
+def run_eval(settings, question):
+    """Run research then evaluate the completed run from its real state and output."""
+    report, state = research(settings, question)
+    results, score = evaluate_run(state, report)
+    print("")
+    print("=" * 60)
+    print("EVALUATION")
+    print("=" * 60)
+    for name, ok in results:
+        print(("PASS" if ok else "FAIL") + " -- " + name)
+    print("-" * 60)
+    print("SCORE: " + str(score) + "/" + str(len(results)))
+    print("=" * 60)
+    return score
 
 
 def main():
     if len(sys.argv) > 1:
         command = sys.argv[1]
+        if command == "--eval":
+            question = " ".join(sys.argv[2:]).strip() if len(sys.argv) > 2 else ""
+            if not question:
+                question = input("Enter your research question: ")
+            print("Your research question: " + question)
+
+            settings, missing = read_settings()
+            if missing:
+                for name in missing:
+                    print("Missing setting: " + name)
+                print("Please set the missing value(s) in your .env file and try again.")
+                return
+
+            run_eval(settings, question)
+            return
         if command == "search_web":
             query = " ".join(sys.argv[2:]) if len(sys.argv) > 2 else ""
             if not query:
@@ -446,7 +499,7 @@ def main():
         print("Please set the missing value(s) in your .env file and try again.")
         return
 
-    reply = research(settings, question)
+    reply, _ = research(settings, question)
     if reply is not None:
         print("Reply from model:")
         print(reply)
