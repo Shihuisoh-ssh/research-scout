@@ -12,7 +12,7 @@ from ddgs import DDGS
 
 ENV_FILE = ".env"
 
-MAX_STEPS = 6
+MAX_STEPS = 8
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -29,8 +29,17 @@ SEARCH_WEB_DESCRIPTION = (
 
 READ_WEBPAGE_DESCRIPTION = (
     "read_webpage(url): Fetch a single web page, strip its HTML to visible text "
-    "(capped at 2000 characters) and return it; use this to read the contents of "
+    "(capped at 5000 characters) and return it; use this to read the contents of "
     "a specific URL."
+)
+
+FINISH_DESCRIPTION = (
+    "finish(report): Write the report. Only choose this after you have read at "
+    "least three different web pages. Base the report on the text of those pages. "
+    "Search result titles and snippets are not enough on their own. Price tickers, "
+    "shop pages and product listings give you a number but no explanation, so "
+    "prefer news articles, analysis and official sources when you choose what to "
+    "read."
 )
 
 
@@ -205,7 +214,7 @@ def read_webpage(url):
     text = soup.get_text(separator="\n")
     lines = [line.strip() for line in text.splitlines()]
     text = "\n".join(line for line in lines if line)
-    return text[:2000]
+    return text[:5000]
 
 
 def _parse_action(text):
@@ -259,18 +268,40 @@ def _format_state(state, question, step):
     return "\n".join(lines)
 
 
-def _collect_sources(state):
-    """Return a de-duplicated list of source URLs seen during the research."""
-    sources = []
+def _split_sources(state):
+    """Return (pages_read, also_found) with no repeats.
+
+    pages_read  : URLs the agent opened and got text back from.
+    also_found  : URLs from search results that were never opened (read).
+    A page that failed to load is neither read nor opened, so it is listed
+    under neither heading.
+    """
+    pages_read = []
+    opened = set()
     for entry in state:
         if entry["action"] == "READ" and entry.get("url"):
-            if entry["url"] not in sources:
-                sources.append(entry["url"])
-        elif entry["action"] == "SEARCH":
+            url = entry["url"]
+            opened.add(url)
+            if entry.get("loaded") and url not in pages_read:
+                pages_read.append(url)
+
+    also_found = []
+    for entry in state:
+        if entry["action"] == "SEARCH":
             for result in entry.get("results", []):
                 url = result.get("url")
-                if url and url not in sources:
-                    sources.append(url)
+                if url and url not in opened and url not in also_found:
+                    also_found.append(url)
+    return pages_read, also_found
+
+
+def _collect_sources(state):
+    """Return the combined honest source set: pages read plus also-found URLs."""
+    pages_read, also_found = _split_sources(state)
+    sources = list(pages_read)
+    for url in also_found:
+        if url not in sources:
+            sources.append(url)
     return sources
 
 
@@ -296,7 +327,7 @@ def _split_report(report):
 def _print_brief(question, state, report):
     """Print the final research brief with the required sections."""
     sections = _split_report(report)
-    sources = _collect_sources(state)
+    pages_read, also_found = _split_sources(state)
     print("")
     print("=" * 60)
     print("RESEARCH BRIEF")
@@ -305,9 +336,15 @@ def _print_brief(question, state, report):
     print("\nFindings:\n" + sections["Findings"].strip())
     print("\nComparison:\n" + sections["Comparison"].strip())
     print("\nRecommendation:\n" + sections["Recommendation"].strip())
-    print("\nSources:")
-    if sources:
-        for index, url in enumerate(sources, 1):
+    print("\nPages read:")
+    if pages_read:
+        for index, url in enumerate(pages_read, 1):
+            print("  " + str(index) + ". " + url)
+    else:
+        print("  (none)")
+    print("\nAlso found:")
+    if also_found:
+        for index, url in enumerate(also_found, 1):
             print("  " + str(index) + ". " + url)
     else:
         print("  (none)")
@@ -322,7 +359,7 @@ def research(settings, question):
         "- SEARCH: " + SEARCH_WEB_DESCRIPTION + " Use it to find pages.\n"
         "- READ: " + READ_WEBPAGE_DESCRIPTION +
         " Page text often contains navigation and menus, so read it critically.\n"
-        "- FINISH: stop researching and return your final report.\n\n"
+        "- FINISH: " + FINISH_DESCRIPTION + "\n\n"
         "On every step reply with ONLY a single JSON object, no prose, in one of:\n"
         '{"reason": "one short sentence", "action": "SEARCH", "query": "..."}\n'
         '{"reason": "one short sentence", "action": "READ", "url": "..."}\n'
@@ -334,11 +371,17 @@ def research(settings, question):
         "Findings: <what you learned>\n"
         "Comparison: <how the sources compare>\n"
         "Recommendation: <what you recommend>\n\n"
+        "Every finding you list must end with the URL it came from, in square "
+        "brackets, for example: \"The merger was announced in March. "
+        "[https://example.com/news/merger]\". If a finding comes from what you "
+        "already knew rather than from a page you read, end it with [no source].\n\n"
         "A failed search or a page that will not load is normal. Record what "
         "happened and choose a different approach on the next step."
     )
 
     state = []
+    read_urls = []       # URLs the agent opened and got text back from
+    seen_urls = set()    # every URL the agent has tried to READ
     for step in range(1, MAX_STEPS + 1):
         messages = [
             {"role": "system", "content": system},
@@ -377,26 +420,62 @@ def research(settings, question):
             )
         elif action == "READ":
             url = action_obj.get("url", "")
-            text = read_webpage(url)
-            if text:
-                observation = "Page text (truncated): " + text[:1500]
-                summary = "loaded " + str(len(text)) + " chars"
+            if url in seen_urls:
+                observation = (
+                    "Refused: URL already read (" + url +
+                    "); read a different page instead."
+                )
+                summary = "duplicate read refused"
+                state.append({
+                    "step": step, "reason": reason, "action": "READ",
+                    "url": url, "loaded": False, "observation": observation,
+                })
             else:
-                observation = "Page could not be loaded or returned no text."
-                summary = "load failed"
-            state.append({
-                "step": step, "reason": reason, "action": "READ",
-                "url": url, "observation": observation,
-            })
+                seen_urls.add(url)
+                text = read_webpage(url)
+                if text:
+                    observation = "Page text (truncated): " + text[:1500]
+                    summary = "loaded " + str(len(text)) + " chars"
+                    read_urls.append(url)
+                else:
+                    observation = "Page could not be loaded or returned no text."
+                    summary = "load failed"
+                state.append({
+                    "step": step, "reason": reason, "action": "READ",
+                    "url": url, "loaded": bool(text), "observation": observation,
+                })
         elif action == "FINISH":
             report = action_obj.get("report", "")
-            state.append({
-                "step": step, "reason": reason, "action": "FINISH",
-                "observation": "Agent finished.",
-            })
-            print("  Observation: agent chose to finish.")
-            _print_brief(question, state, report)
-            return report, state
+            if not report or not report.strip():
+                note = (
+                    "FINISH refused: the report is empty. Read at least three "
+                    "different pages, then write a non-empty report."
+                )
+                state.append({
+                    "step": step, "reason": reason, "action": "FINISH",
+                    "refused": True, "observation": note,
+                })
+                print("  Observation: " + note)
+            elif len(read_urls) < 3:
+                note = (
+                    "FINISH refused: only " + str(len(read_urls)) +
+                    " page(s) read successfully; 3 are required before FINISH; "
+                    "choose READ next."
+                )
+                state.append({
+                    "step": step, "reason": reason, "action": "FINISH",
+                    "refused": True, "observation": note,
+                })
+                print("  Observation: " + note)
+            else:
+                state.append({
+                    "step": step, "reason": reason, "action": "FINISH",
+                    "refused": False, "observation": "Agent finished.",
+                })
+                print("  Observation: agent chose to finish.")
+                _print_brief(question, state, report)
+                return report, state
+            continue
         else:
             observation = "Unknown action: " + str(action)
             summary = "unknown action"
@@ -424,7 +503,10 @@ def evaluate_run(state, report):
     sources = _collect_sources(state)
     results.append(("more than one distinct source consulted", len(sources) > 1))
 
-    finished = any(entry["action"] == "FINISH" for entry in state)
+    finished = any(
+        entry["action"] == "FINISH" and not entry.get("refused")
+        for entry in state
+    )
     results.append(("run stayed within step limit", finished))
 
     sections = _split_report(report) if report else {"Recommendation": ""}
