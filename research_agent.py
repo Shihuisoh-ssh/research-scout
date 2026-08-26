@@ -193,8 +193,20 @@ def search_web(query):
 
 
 def read_webpage(url):
-    """Fetch a web page, strip the HTML to visible text capped at 2000 chars."""
-    headers = {"User-Agent": USER_AGENT}
+    """Fetch a web page, strip the HTML to visible text capped at 5000 chars."""
+    headers = {
+        "User-Agent": USER_AGENT,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,"
+                  "image/avif,image/webp,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Connection": "keep-alive",
+        "Upgrade-Insecure-Requests": "1",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "none",
+        "Sec-Fetch-User": "?1",
+    }
     try:
         response = requests.get(url, headers=headers, timeout=60)
     except Exception as e:
@@ -373,8 +385,12 @@ def research(settings, question):
         "Recommendation: <what you recommend>\n\n"
         "Every finding you list must end with the URL it came from, in square "
         "brackets, for example: \"The merger was announced in March. "
-        "[https://example.com/news/merger]\". If a finding comes from what you "
-        "already knew rather than from a page you read, end it with [no source].\n\n"
+        "[https://example.com/news/merger]\". Only put a URL in brackets if that "
+        "exact page is one you READ (it will appear in the Pages read list); a "
+        "fact taken from a search snippet or result title must end with "
+        "[no source], not with the search result's URL. If a finding comes from "
+        "what you already knew rather than from a page you read, end it with "
+        "[no source].\n\n"
         "A failed search or a page that will not load is normal. Record what "
         "happened and choose a different approach on the next step."
     )
@@ -434,7 +450,7 @@ def research(settings, question):
                 seen_urls.add(url)
                 text = read_webpage(url)
                 if text:
-                    observation = "Page text (truncated): " + text[:1500]
+                    observation = "Page text: " + text
                     summary = "loaded " + str(len(text)) + " chars"
                     read_urls.append(url)
                 else:
@@ -581,10 +597,7 @@ def main():
         print("Please set the missing value(s) in your .env file and try again.")
         return
 
-    reply, _ = research(settings, question)
-    if reply is not None:
-        print("Reply from model:")
-        print(reply)
+    research(settings, question)
 
 
 if __name__ == "__main__":
